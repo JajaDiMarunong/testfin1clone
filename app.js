@@ -1976,6 +1976,15 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       `[AR] Preparing ${uploadedArtworks.length} Firebase marker(s) in the background…`
     );
 
+    updateFirebaseARStatus({
+      phase: "checking-cache",
+      progress: 5,
+      loaded: 0,
+      total: uploadedArtworks.length,
+      ready: false,
+      message: `Checking for a cached AR target library…`,
+    });
+
     // IMPORTANT: the built-in marker images are compiled into the combined
     // library using the exact same local files already used by the app.
     // The existing static targets.mind is still used first, so built-ins are
@@ -1996,6 +2005,15 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       console.log(
         "[AR] Using cached combined target library (skipping recompilation)."
       );
+
+      updateFirebaseARStatus({
+        phase: "ready",
+        progress: 100,
+        loaded: uploadedArtworks.length,
+        total: uploadedArtworks.length,
+        ready: true,
+        message: `AR ready (loaded from cache) — ${combinedArtworkList.length} artwork(s) total.`,
+      });
 
       if (combinedObjectUrl) {
         URL.revokeObjectURL(combinedObjectUrl);
@@ -2025,6 +2043,15 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
     }
 
     // ---- Slow path: nothing cached (or artwork set changed) — compile ----
+    updateFirebaseARStatus({
+      phase: "loading-images",
+      progress: 10,
+      loaded: 0,
+      total: combinedArtworkList.length,
+      ready: false,
+      message: `Downloading ${combinedArtworkList.length} marker image(s)…`,
+    });
+
     const results = await Promise.allSettled(
       combinedArtworkList.map((art) => loadImage(art.markerImage))
     );
@@ -2064,6 +2091,12 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       console.warn(
         "[AR] No Firebase marker images could be compiled. Keeping the original built-in AR scene."
       );
+      updateFirebaseARStatus({
+        phase: "error",
+        progress: 0,
+        ready: false,
+        message: `Couldn't load any Firebase marker image(s) — check the image URLs and Firebase Storage CORS settings.`,
+      });
       return null;
     }
 
@@ -2072,6 +2105,12 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
         "[AR] Firebase markers loaded, but no built-in marker could be compiled. " +
         "Keeping the original built-in AR scene to protect existing functionality."
       );
+      updateFirebaseARStatus({
+        phase: "error",
+        progress: 0,
+        ready: false,
+        message: `Firebase markers loaded, but a built-in marker failed — keeping the original AR scene.`,
+      });
       return null;
     }
 
@@ -2079,8 +2118,52 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       `[AR] Compiling combined target library: ${builtinCompiledCount} built-in + ${uploadedCompiledCount} Firebase marker(s).`
     );
 
+    updateFirebaseARStatus({
+      phase: "compiling",
+      progress: 20,
+      loaded: compiledArtworks.length,
+      total: combinedArtworkList.length,
+      ready: false,
+      message: `Compiling AR targets (0%)…`,
+    });
+
     const compiler = new window.MINDAR.IMAGE.Compiler();
-    await compiler.compileImageTargets(images);
+
+    // MindAR's compiler *may* call this with a 0-100 percent as each target
+    // finishes — if so we use real numbers. But not every build reliably
+    // fires it, so we also run a gentle simulated-progress ticker in
+    // parallel (an ease-toward-88% curve) purely so the bar keeps visibly
+    // moving during the slow compile step instead of sitting frozen. Real
+    // progress, when it arrives, always overrides the simulated value.
+    let compileProgress = 20;
+    const progressTicker = setInterval(() => {
+      compileProgress += (88 - compileProgress) * 0.12;
+      updateFirebaseARStatus({
+        phase: "compiling",
+        progress: compileProgress,
+        message: `Compiling AR targets…`,
+      });
+    }, 600);
+
+    try {
+      await compiler.compileImageTargets(images, (percent) => {
+        const clamped = Math.max(0, Math.min(100, percent));
+        compileProgress = 20 + (clamped / 100) * 70; // 20%–90% of the overall bar
+        updateFirebaseARStatus({
+          phase: "compiling",
+          progress: compileProgress,
+          message: `Compiling AR targets (${Math.round(clamped)}%)…`,
+        });
+      });
+    } finally {
+      clearInterval(progressTicker);
+    }
+
+    updateFirebaseARStatus({
+      phase: "exporting",
+      progress: 92,
+      message: `Finalizing AR target library…`,
+    });
 
     const exportedBuffer = await compiler.exportData();
 
@@ -2109,6 +2192,15 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       `[AR] Combined target library ready: ${compiledArtworks.length} total target(s).`
     );
 
+    updateFirebaseARStatus({
+      phase: "ready",
+      progress: 100,
+      loaded: compiledArtworks.length,
+      total: combinedArtworkList.length,
+      ready: true,
+      message: `AR ready — ${compiledArtworks.length} artwork(s) available for scanning.`,
+    });
+
     // Only restart MindAR automatically if the user is actually looking at
     // the scanner. If they are elsewhere in the app, keep the compiled data
     // ready and activate it the next time they open the scanner.
@@ -2124,6 +2216,12 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
     return combinedTargetData;
   })().catch((err) => {
     console.error("[AR] Background combined marker compilation failed:", err);
+    updateFirebaseARStatus({
+      phase: "error",
+      progress: 0,
+      ready: false,
+      message: `AR preparation failed: ${err.message || err}`,
+    });
     combinedTargetData = null;
     return null;
   });
