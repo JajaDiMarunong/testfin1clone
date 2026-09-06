@@ -1568,6 +1568,35 @@ function getPinchDistance(touches) {
 // AR INITIALIZATION
 // =====================================================================
 let arInitializationPromise = null;
+let firebaseArtworkLoadPromise = null;
+let firebaseARPreparationScheduled = false;
+let lastUserInteractionAt = performance.now();
+
+function noteUserInteraction() {
+  lastUserInteractionAt = performance.now();
+}
+
+["pointerdown", "touchstart", "keydown", "wheel"].forEach((eventName) => {
+  window.addEventListener(eventName, noteUserInteraction, { passive: true });
+});
+
+function waitForUiIdle(quietMs = 1200) {
+  return new Promise((resolve) => {
+    const check = () => {
+      const elapsed = performance.now() - lastUserInteractionAt;
+      if (elapsed >= quietMs) { resolve(); return; }
+      setTimeout(check, Math.max(100, quietMs - elapsed));
+    };
+    check();
+  });
+}
+
+function yieldToUi() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(resolve);
+    else setTimeout(resolve, 0);
+  });
+}
 
 // The first AR scene uses the existing, proven targets.mind file so the
 // built-in artworks behave exactly as they did before.
@@ -2171,11 +2200,14 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
     const compiledArtworks = [];
     const images = [];
 
-    results.forEach((result, i) => {
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
       const art = combinedArtworkList[i];
 
       if (result.status === "fulfilled") {
         try {
+          await waitForUiIdle(150);
+          await yieldToUi();
           compiledArtworks.push(art);
           images.push(prepareMarkerImage(result.value));
         } catch (err) {
@@ -2190,7 +2222,10 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
           result.reason
         );
       }
-    });
+    }
+
+    await waitForUiIdle(1800);
+    await yieldToUi();
 
     const builtinCompiledCount = compiledArtworks.filter((art) =>
       bundledTargetIds.has(art.id)
@@ -2404,11 +2439,7 @@ async function initAR() {
     // Nothing waits for Firebase image downloads or compilation here.
     buildARScene(builtinScannable, imageTargetSrc, "builtin");
 
-    // Firebase compilation is deliberately fire-and-forget.
-    // It never changes loadingText, loadingProgressFill, or the visible UI.
-    prepareCombinedMarkersInBackground(bundledTargetIds).catch((err) => {
-      console.error("[AR] Background marker preparation error:", err);
-    });
+    // Firebase AR preparation is scheduled separately after the UI is interactive.
 
     return;
   }
@@ -2468,86 +2499,121 @@ async function initAR() {
 // =====================================================================
 // DYNAMIC ARTWORK LOADING (built-in + Firebase uploads)
 // =====================================================================
-async function initArtworks() {
-  // Always start with built-in artworks so the local museum works even
-  // when Firebase is unavailable or the device is offline.
-  const merged = BUILTIN_ARTWORKS.map((a) => ({ ...a }));
+function initArtworks() {
+  // Local built-ins are the critical startup data.
+  artworks = BUILTIN_ARTWORKS.map((a) => ({ ...a }));
+  return artworks;
+}
 
-  // Do not wait on Firebase at all when the browser is offline.
-  if (navigator.onLine === false) {
-    console.log("[Firebase] Offline — using built-in artworks only.");
-    artworks = merged;
-    return;
-  }
+async function parseFirebaseJsonOffMainThread(text) {
+  if (typeof Worker === "undefined" || text.length < 100000) return JSON.parse(text);
+
+  const workerSource = `
+    self.onmessage = function(event) {
+      try {
+        self.postMessage({ ok: true, data: JSON.parse(event.data) });
+      } catch (error) {
+        self.postMessage({ ok: false, error: error && error.message ? error.message : String(error) });
+      }
+    };
+  `;
+  const blob = new Blob([workerSource], { type: "application/javascript" });
+  const workerUrl = URL.createObjectURL(blob);
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    const res = await fetch(`${FIREBASE_URL}/artworks.json`, {
-      method: "GET",
-      cache: "default",
-      signal: controller.signal,
+    return await new Promise((resolve, reject) => {
+      const worker = new Worker(workerUrl);
+      const cleanup = () => { worker.terminate(); URL.revokeObjectURL(workerUrl); };
+      worker.onmessage = (event) => {
+        cleanup();
+        if (event.data?.ok) resolve(event.data.data);
+        else reject(new Error(event.data?.error || "Could not parse Firebase artwork data."));
+      };
+      worker.onerror = (error) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error("Firebase JSON worker failed."));
+      };
+      worker.postMessage(text);
     });
+  } catch (error) {
+    console.warn("[Firebase] Worker JSON parsing unavailable; using main-thread parsing.", error);
+    return JSON.parse(text);
+  }
+}
 
-    clearTimeout(timeout);
+async function loadFirebaseArtworksInBackground() {
+  if (firebaseArtworkLoadPromise) return firebaseArtworkLoadPromise;
 
-    if (!res.ok) {
-      throw new Error(`Firebase returned HTTP ${res.status}`);
-    }
+  firebaseArtworkLoadPromise = (async () => {
+    if (navigator.onLine === false) return [];
 
-    const data = await res.json();
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(`${FIREBASE_URL}/artworks.json`, {
+        method: "GET", cache: "default", signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`Firebase returned HTTP ${res.status}`);
 
-    if (!data || typeof data !== "object") {
-      artworks = merged;
-      return;
-    }
+      const text = await res.text();
+      if (!text || text === "null") return [];
+      const data = await parseFirebaseJsonOffMainThread(text);
+      if (!data || typeof data !== "object") return [];
 
-    const uploaded = Object.entries(data)
-      .map(([key, val]) => {
+      const uploaded = Object.entries(data).map(([key, val]) => {
         if (!val || typeof val !== "object") return null;
-
         const image = val.image || "";
         const thumbnail = val.thumbnail || image;
         const markerImage = val.markerImage || image;
-
-        if (!image) {
-          console.warn(`[Firebase] Artwork "${key}" has no image URL.`);
-          return null;
-        }
-
+        if (!image) return null;
         return {
-          id: key,
-          name: val.name || "Untitled Artwork",
-          image,
-          thumbnail,
-          markerImage,
-          artist: val.artist || "",
-          year: val.year || "",
-          location: val.location || "",
-          details: val.details || "",
-          modelObj: null,
-          modelMtl: null,
-          baseScale: Number(val.baseScale) || 0.06,
-          icon: val.icon || "🖼️",
-          unlocked: false,
-          quizCompleted: false,
-          quiz: Array.isArray(val.quiz) ? val.quiz : [],
+          id: key, name: val.name || "Untitled Artwork", image, thumbnail, markerImage,
+          artist: val.artist || "", year: val.year || "", location: val.location || "",
+          details: val.details || "", modelObj: null, modelMtl: null,
+          baseScale: Number(val.baseScale) || 0.06, icon: val.icon || "🖼️",
+          unlocked: false, quizCompleted: false, quiz: Array.isArray(val.quiz) ? val.quiz : [],
         };
-      })
-      .filter(Boolean);
+      }).filter(Boolean);
 
-    artworks = merged.concat(uploaded);
-    console.log(`[Firebase] Loaded ${uploaded.length} uploaded artwork(s).`);
-  } catch (err) {
-    if (err.name === "AbortError") {
-      console.warn("[Firebase] Artwork request timed out. Continuing with built-in artworks.");
-    } else {
-      console.warn("[Firebase] Could not load uploaded artworks:", err);
+      if (!uploaded.length) {
+        updateFirebaseARStatus({ phase: "waiting", progress: 0, loaded: 0, total: 0, ready: false, message: "No Firebase-uploaded artworks found yet." });
+        return [];
+      }
+
+      artworks = [...BUILTIN_ARTWORKS.map((a) => ({ ...a })), ...uploaded];
+      console.log(`[Firebase] Loaded ${uploaded.length} uploaded artwork(s) in background.`);
+
+      if (typeof renderGallery === "function" && !screenHome.classList.contains("hidden")) renderGallery();
+
+      const bundledTargetIds = new Set(
+        BUILTIN_ARTWORKS.filter((a) => a.markerImage).map((a) => a.id)
+      );
+
+      updateFirebaseARStatus({
+        phase: "waiting", progress: 0, loaded: 0, total: uploaded.length, ready: false,
+        message: "Firebase artworks loaded. AR preparation will run when the UI is idle.",
+      });
+
+      if (!firebaseARPreparationScheduled) {
+        firebaseARPreparationScheduled = true;
+        setTimeout(async () => {
+          try {
+            if (arInitializationPromise) await arInitializationPromise;
+            await waitForUiIdle(2500);
+            await prepareCombinedMarkersInBackground(bundledTargetIds);
+          } catch (err) {
+            console.error("[AR] Deferred Firebase preparation failed:", err);
+          }
+        }, 1500);
+      }
+      return uploaded;
+    } catch (err) {
+      console.warn("[Firebase] Background artwork loading failed; built-in artworks remain available.", err);
+      return [];
     }
-
-    artworks = merged;
-  }
+  })();
+  return firebaseArtworkLoadPromise;
 }
 
 
@@ -2951,55 +3017,56 @@ function exitImmersive() {
 // BOOT
 // =====================================================================
 async function bootMuseum() {
-  if (window.MuseumOffline) {
-    loadingText.textContent = "Downloading museum for offline use…";
-    await window.MuseumOffline.preloadAssets(({ completed, total, failed }) => {
-      const percent = total ? Math.round((completed / total) * 100) : 0;
-      loadingProgressFill.style.width = `${percent}%`;
-      loadingProgressFill.parentElement.setAttribute("aria-valuenow", String(percent));
-      loadingProgressText.textContent = failed
-        ? `${completed} / ${total} files ready (${failed} will retry later)`
-        : `${completed} / ${total} files ready`;
-    });
-  }
-  await initArtworks();
-
-  const firebaseArtworkCount = artworks.filter(
-    (a) => a.markerImage && !BUILTIN_ARTWORKS.some((b) => b.id === a.id)
-  ).length;
-
-  updateFirebaseARStatus({
-    phase: "waiting",
-    progress: 0,
-    loaded: 0,
-    total: firebaseArtworkCount,
-    ready: false,
-    message: firebaseArtworkCount
-      ? `Firebase artworks loaded. Waiting to prepare ${firebaseArtworkCount} marker(s) for AR…`
-      : "No Firebase-uploaded artworks found yet."
-  });
+  // Critical path: local museum + built-in AR only. Firebase never blocks boot.
+  initArtworks();
   restoreProgress();
+
   if (currentUsername) {
     screenUsername.classList.add("hidden");
     showHome();
     initTour();
   }
-navigator.mediaDevices?.getUserMedia?.({ video: true })
-  .then((stream) => {
-    stream.getTracks().forEach((track) => track.stop());
 
-    // Start AR preparation in the background.
-    // Do NOT await it here, so the museum UI can continue loading.
-    arInitializationPromise = initAR().catch((err) => {
-      console.error("Background AR initialization failed:", err);
-      throw err;
-    });
-  })
-  .catch((err) => {
-    console.error("Camera/AR init failed:", err);
-    loadingScreen.classList.add("hidden");
-    permissionError.classList.remove("hidden");
+  loadingScreen.classList.add("hidden");
+
+  updateFirebaseARStatus({
+    phase: "waiting", progress: 0, loaded: 0, total: 0, ready: false,
+    message: "Built-in museum ready. Firebase artworks will load in the background.",
   });
+
+  // Offline caching is also background work and must not delay the UI.
+  if (window.MuseumOffline) {
+    setTimeout(() => {
+      window.MuseumOffline.preloadAssets(({ completed, total, failed }) => {
+        const percent = total ? Math.round((completed / total) * 100) : 0;
+        loadingProgressFill.style.width = `${percent}%`;
+        loadingProgressFill.parentElement.setAttribute("aria-valuenow", String(percent));
+        loadingProgressText.textContent = failed
+          ? `${completed} / ${total} files ready (${failed} will retry later)`
+          : `${completed} / ${total} files ready`;
+      }).catch((err) => console.warn("[Offline] Background preload failed:", err));
+    }, 2000);
+  }
+
+  // Built-in AR starts independently of Firebase. The local targets.mind path
+  // remains the fast/offline scanner for all bundled artworks.
+  arInitializationPromise = initAR().catch((err) => {
+    console.error("Background AR initialization failed:", err);
+    return null;
+  });
+
+  // Request camera permission without awaiting it. Navigation stays responsive.
+  navigator.mediaDevices?.getUserMedia?.({ video: true })
+    .then((stream) => stream.getTracks().forEach((track) => track.stop()))
+    .catch((err) => {
+      console.error("Camera permission/init failed:", err);
+      permissionError.classList.remove("hidden");
+    });
+
+  // Firebase metadata is intentionally delayed until after the app is interactive.
+  setTimeout(() => {
+    loadFirebaseArtworksInBackground().catch((err) => console.error("[Firebase] Background load failed:", err));
+  }, 2000);
 }
 
 bootMuseum();
