@@ -575,6 +575,12 @@ async function showScanner() {
       await arInitializationPromise;
     }
 
+    // If the combined Firebase + built-in target library finished compiling
+    // while the scanner was closed, activate it now without a page reload.
+    if (combinedTargetData && !isCombinedARActive()) {
+      await switchToCombinedAR();
+    }
+
     scanHint.textContent = "Point your camera at an artwork";
   } catch (err) {
     console.error("AR initialization failed:", err);
@@ -1538,6 +1544,20 @@ function getPinchDistance(touches) {
 // AR INITIALIZATION
 // =====================================================================
 let arInitializationPromise = null;
+
+// The first AR scene uses the existing, proven targets.mind file so the
+// built-in artworks behave exactly as they did before.
+//
+// Firebase marker images are compiled in the background. Once that finishes,
+// we replace the running MindAR scene with ONE combined target library that
+// contains the original built-ins + the Firebase uploads.
+let combinedTargetData = null;
+let combinedCompilePromise = null;
+let combinedSwitchQueued = false;
+let activeTargetCount = 0;
+let activeARTargetMode = "builtin";
+let combinedObjectUrl = null;
+
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -1710,6 +1730,8 @@ function getOrCreateModelEntity(art, targetIndex, targetEl) {
 }
 
 function handleTargetFound(art, targetIndex, targetEl) {
+  activeTargetCount++;
+
   scanHint.textContent = "Pinch to zoom · Drag to rotate";
   scanHint.classList.add("found");
 
@@ -1739,9 +1761,21 @@ function handleTargetFound(art, targetIndex, targetEl) {
 }
 
 function handleTargetLost() {
+  activeTargetCount = Math.max(0, activeTargetCount - 1);
+
   scanHint.textContent = "Point your camera at an artwork";
   scanHint.classList.remove("found");
   activeModelEl = null;
+
+  // If the combined target library finished while the user was looking at
+  // an artwork, switch only after that target has been lost. This avoids
+  // interrupting a successful scan halfway through.
+  if (activeTargetCount === 0 && combinedSwitchQueued && combinedTargetData) {
+    combinedSwitchQueued = false;
+    switchToCombinedAR().catch((err) => {
+      console.error("Could not activate combined AR target library:", err);
+    });
+  }
 }
 
 function checkCollectionComplete() {
@@ -1755,73 +1789,49 @@ function checkCollectionComplete() {
 }
 
 // -------------------------------------------------------------------
-// Build AR scene
+// MindAR scene creation / replacement
 // -------------------------------------------------------------------
-async function initAR() {
-  const bundledTargetIds = new Set(BUILTIN_ARTWORKS.filter((a) => a.markerImage).map((a) => a.id));
-  
-  // If there are uploaded (non-builtin) artworks, we MUST compile at runtime
-  // because the static targets.mind only contains built-ins.
-  const hasUploadedMarkers = artworks.some((a) => a.markerImage && !bundledTargetIds.has(a.id));
-  
-  let scannable = [];
-  let imageTargetSrc = "./assets/targets.mind";
-  let useRuntimeCompile = hasUploadedMarkers;
+function isCombinedARActive() {
+  return activeARTargetMode === "combined" && !!document.getElementById("ar-scene");
+}
 
-  // Try the fast path (pre-compiled .mind file) only if no uploaded markers exist
-  if (!useRuntimeCompile) {
-    try {
-      const targetResponse = await fetch(imageTargetSrc, { cache: "no-store" });
-      if (!targetResponse.ok) throw new Error(`status ${targetResponse.status}`);
-      loadingText.textContent = "Recognition data ready. Starting camera…";
-      scannable = artworks.filter((a) => bundledTargetIds.has(a.id) && a.markerImage);
-    } catch (error) {
-      console.warn("Static MindAR target file missing; using runtime compilation.", error);
-      useRuntimeCompile = true;
+function stopAndRemoveCurrentARScene() {
+  const oldScene = document.getElementById("ar-scene");
+  if (!oldScene) return;
+
+  try {
+    const mindarSystem =
+      oldScene.systems && oldScene.systems["mindar-image-system"];
+
+    if (mindarSystem && typeof mindarSystem.stop === "function") {
+      mindarSystem.stop();
     }
+  } catch (err) {
+    console.warn("Could not cleanly stop the previous MindAR session:", err);
   }
 
-  // Runtime compilation path: works for both built-in AND uploaded artworks
-  if (useRuntimeCompile) {
-    scannable = artworks.filter((a) => a.markerImage);
+  try {
+    oldScene.pause?.();
+  } catch (_) {}
 
-    if (scannable.length === 0) {
-      throw new Error("No artworks have marker images available for scanning.");
-    }
+  oldScene.remove();
+  activeModelEl = null;
+  activeTargetCount = 0;
+}
 
-    loadingText.textContent = "Loading artwork images…";
-    const results = await Promise.allSettled(scannable.map((a) => loadImage(a.markerImage)));
-
-    const compiled = [];
-    const images = [];
-    results.forEach((result, i) => {
-      if (result.status === "fulfilled") {
-        compiled.push(scannable[i]);
-        images.push(prepareMarkerImage(result.value));
-      } else {
-        console.error(
-          `Marker image failed to load for "${scannable[i].name}" (${scannable[i].markerImage}). ` +
-          `Check the file exists and CORS is enabled if it's an external URL.`
-        );
-      }
-    });
-
-    if (images.length === 0) {
-      throw new Error("No marker images could be loaded at all — check your assets folder and file paths.");
-    }
-
-    loadingText.textContent = "Preparing recognition data…";
-    const compiler = new window.MINDAR.IMAGE.Compiler();
-    await compiler.compileImageTargets(images, (progress) => {
-      loadingText.textContent = `Preparing recognition data… ${Math.round(progress)}%`;
-    });
-    const exportedBuffer = await compiler.exportData();
-    imageTargetSrc = URL.createObjectURL(new Blob([exportedBuffer]));
-    scannable = compiled;
+function buildARScene(scannable, imageTargetSrc, mode = "builtin") {
+  if (!scannable || scannable.length === 0) {
+    throw new Error("No artworks are available for AR scanning.");
   }
+
+  activeARTargetMode = mode;
+  activeModelEl = null;
+  activeTargetCount = 0;
 
   const targetEntities = scannable
-    .map((art, i) => `<a-entity id="ar-target-${i}" mindar-image-target="targetIndex: ${i}"></a-entity>`)
+    .map((art, i) =>
+      `<a-entity id="ar-target-${i}" mindar-image-target="targetIndex: ${i}"></a-entity>`
+    )
     .join("\n");
 
   arContainer.innerHTML = `
@@ -1840,15 +1850,275 @@ async function initAR() {
   `;
 
   const arScene = document.getElementById("ar-scene");
+
   arScene.addEventListener("renderstart", () => {
+    // The initial built-in scene controls the real loading-screen dismissal.
+    // The background Firebase compiler never changes loadingText or blocks UI.
     setTimeout(() => loadingScreen.classList.add("hidden"), 300);
   });
 
   scannable.forEach((art, i) => {
     const targetEl = document.getElementById(`ar-target-${i}`);
-    targetEl.addEventListener("targetFound", () => handleTargetFound(art, i, targetEl));
+    if (!targetEl) return;
+
+    targetEl.addEventListener("targetFound", () =>
+      handleTargetFound(art, i, targetEl)
+    );
     targetEl.addEventListener("targetLost", handleTargetLost);
   });
+
+  return arScene;
+}
+
+// -------------------------------------------------------------------
+// Background compilation of Firebase + built-in markers
+// -------------------------------------------------------------------
+async function prepareCombinedMarkersInBackground(bundledTargetIds) {
+  if (combinedCompilePromise) return combinedCompilePromise;
+
+  const uploadedArtworks = artworks.filter(
+    (art) => art.markerImage && !bundledTargetIds.has(art.id)
+  );
+
+  if (uploadedArtworks.length === 0) {
+    return null;
+  }
+
+  combinedCompilePromise = (async () => {
+    console.log(
+      `[AR] Preparing ${uploadedArtworks.length} Firebase marker(s) in the background…`
+    );
+
+    // IMPORTANT: the built-in marker images are compiled into the combined
+    // library using the exact same local files already used by the app.
+    // The existing static targets.mind is still used first, so built-ins are
+    // immediately available while this work happens silently in the background.
+    const combinedArtworkList = [
+      ...BUILTIN_ARTWORKS.filter((art) => art.markerImage),
+      ...uploadedArtworks,
+    ];
+
+    const results = await Promise.allSettled(
+      combinedArtworkList.map((art) => loadImage(art.markerImage))
+    );
+
+    const compiledArtworks = [];
+    const images = [];
+
+    results.forEach((result, i) => {
+      const art = combinedArtworkList[i];
+
+      if (result.status === "fulfilled") {
+        try {
+          compiledArtworks.push(art);
+          images.push(prepareMarkerImage(result.value));
+        } catch (err) {
+          console.error(
+            `[AR] Could not prepare marker image for "${art.name}":`,
+            err
+          );
+        }
+      } else {
+        console.error(
+          `[AR] Marker image failed to load for "${art.name}" (${art.markerImage}).`,
+          result.reason
+        );
+      }
+    });
+
+    const builtinCompiledCount = compiledArtworks.filter((art) =>
+      bundledTargetIds.has(art.id)
+    ).length;
+    const uploadedCompiledCount = compiledArtworks.filter((art) =>
+      !bundledTargetIds.has(art.id)
+    ).length;
+
+    if (uploadedCompiledCount === 0) {
+      console.warn(
+        "[AR] No Firebase marker images could be compiled. Keeping the original built-in AR scene."
+      );
+      return null;
+    }
+
+    if (builtinCompiledCount === 0) {
+      console.warn(
+        "[AR] Firebase markers loaded, but no built-in marker could be compiled. " +
+        "Keeping the original built-in AR scene to protect existing functionality."
+      );
+      return null;
+    }
+
+    console.log(
+      `[AR] Compiling combined target library: ${builtinCompiledCount} built-in + ${uploadedCompiledCount} Firebase marker(s).`
+    );
+
+    const compiler = new window.MINDAR.IMAGE.Compiler();
+    await compiler.compileImageTargets(images);
+
+    const exportedBuffer = await compiler.exportData();
+
+    if (combinedObjectUrl) {
+      URL.revokeObjectURL(combinedObjectUrl);
+      combinedObjectUrl = null;
+    }
+
+    combinedObjectUrl = URL.createObjectURL(
+      new Blob([exportedBuffer], { type: "application/octet-stream" })
+    );
+
+    combinedTargetData = {
+      artworks: compiledArtworks,
+      imageTargetSrc: combinedObjectUrl,
+    };
+
+    console.log(
+      `[AR] Combined target library ready: ${compiledArtworks.length} total target(s).`
+    );
+
+    // Only restart MindAR automatically if the user is actually looking at
+    // the scanner. If they are elsewhere in the app, keep the compiled data
+    // ready and activate it the next time they open the scanner.
+    if (!screenScanner.classList.contains("hidden")) {
+      if (activeTargetCount > 0) {
+        combinedSwitchQueued = true;
+        console.log("[AR] Combined library ready; waiting for current target to be lost before switching.");
+      } else {
+        await switchToCombinedAR();
+      }
+    }
+
+    return combinedTargetData;
+  })().catch((err) => {
+    console.error("[AR] Background combined marker compilation failed:", err);
+    combinedTargetData = null;
+    return null;
+  });
+
+  return combinedCompilePromise;
+}
+
+async function switchToCombinedAR() {
+  if (!combinedTargetData) return;
+  if (isCombinedARActive()) return;
+
+  // If the scanner is not currently visible, do not start/restart the camera.
+  // showScanner() will activate the ready combined library when opened.
+  if (screenScanner.classList.contains("hidden")) return;
+
+  const { artworks: scannable, imageTargetSrc } = combinedTargetData;
+
+  if (!scannable || !scannable.length || !imageTargetSrc) {
+    console.warn("[AR] Combined target data is incomplete; keeping current AR scene.");
+    return;
+  }
+
+  console.log("[AR] Switching to combined built-in + Firebase target library…");
+
+  stopAndRemoveCurrentARScene();
+  buildARScene(scannable, imageTargetSrc, "combined");
+
+  // Give A-Frame/MindAR a moment to create the new scene before updating the hint.
+  setTimeout(() => {
+    if (!screenScanner.classList.contains("hidden")) {
+      scanHint.textContent = "Point your camera at an artwork";
+      scanHint.classList.remove("found");
+    }
+  }, 250);
+}
+
+// -------------------------------------------------------------------
+// Initial AR startup
+// -------------------------------------------------------------------
+async function initAR() {
+  const bundledTargetIds = new Set(
+    BUILTIN_ARTWORKS
+      .filter((a) => a.markerImage)
+      .map((a) => a.id)
+  );
+
+  let staticTargetsAvailable = false;
+  const imageTargetSrc = "./assets/targets.mind";
+
+  // Fast path: use the existing static .mind file exactly as before.
+  // This is what makes the built-in artworks immediately scannable.
+  try {
+    const targetResponse = await fetch(imageTargetSrc, { cache: "no-store" });
+    if (!targetResponse.ok) {
+      throw new Error(`status ${targetResponse.status}`);
+    }
+    staticTargetsAvailable = true;
+  } catch (error) {
+    console.warn("[AR] Static MindAR target file unavailable:", error);
+  }
+
+  const builtinScannable = artworks.filter(
+    (art) => bundledTargetIds.has(art.id) && art.markerImage
+  );
+
+  if (staticTargetsAvailable && builtinScannable.length > 0) {
+    // IMPORTANT: mount the proven built-in scene FIRST.
+    // Nothing waits for Firebase image downloads or compilation here.
+    buildARScene(builtinScannable, imageTargetSrc, "builtin");
+
+    // Firebase compilation is deliberately fire-and-forget.
+    // It never changes loadingText, loadingProgressFill, or the visible UI.
+    prepareCombinedMarkersInBackground(bundledTargetIds).catch((err) => {
+      console.error("[AR] Background marker preparation error:", err);
+    });
+
+    return;
+  }
+
+  // Fallback only if the static built-in target file is missing/unusable.
+  // In that case we must compile the available markers before AR can start.
+  const fallbackScannable = artworks.filter((a) => a.markerImage);
+
+  if (fallbackScannable.length === 0) {
+    throw new Error("No artworks have marker images available for scanning.");
+  }
+
+  console.warn("[AR] Falling back to runtime compilation because targets.mind is unavailable.");
+
+  const results = await Promise.allSettled(
+    fallbackScannable.map((a) => loadImage(a.markerImage))
+  );
+
+  const compiled = [];
+  const images = [];
+
+  results.forEach((result, i) => {
+    if (result.status === "fulfilled") {
+      try {
+        compiled.push(fallbackScannable[i]);
+        images.push(prepareMarkerImage(result.value));
+      } catch (err) {
+        console.error(
+          `Marker image could not be prepared for "${fallbackScannable[i].name}":`,
+          err
+        );
+      }
+    } else {
+      console.error(
+        `Marker image failed to load for "${fallbackScannable[i].name}" (${fallbackScannable[i].markerImage}).`,
+        result.reason
+      );
+    }
+  });
+
+  if (images.length === 0) {
+    throw new Error(
+      "No marker images could be loaded at all — check your assets folder and Firebase Storage CORS settings."
+    );
+  }
+
+  const compiler = new window.MINDAR.IMAGE.Compiler();
+  await compiler.compileImageTargets(images);
+  const exportedBuffer = await compiler.exportData();
+  const fallbackObjectUrl = URL.createObjectURL(
+    new Blob([exportedBuffer], { type: "application/octet-stream" })
+  );
+
+  buildARScene(compiled, fallbackObjectUrl, "combined");
 }
 
 // =====================================================================
