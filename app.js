@@ -695,16 +695,24 @@ function renderLibrary() {
       (art, i) => `
     <div class="library-card" data-index="${i}">
       <div class="library-card-photo">
-        <img src="${art.image}" alt="${art.name}"
-             onerror="this.style.display='none'; this.closest('.library-card').querySelector('.library-fallback').style.display='flex';" />
-        <div class="library-fallback" style="display:none;">${art.icon}</div>
+        <img
+          src="${escapeHtml(art.thumbnail || art.image || "")}"
+          alt="${escapeHtml(art.name || "Artwork")}" 
+          loading="lazy"
+          decoding="async"
+          fetchpriority="low"
+          width="400"
+          height="300"
+          onerror="this.style.display='none'; this.closest('.library-card').querySelector('.library-fallback').style.display='flex';"
+        />
+        <div class="library-fallback" style="display:none;">${escapeHtml(art.icon || "🖼️")}</div>
       </div>
       <div class="library-card-info">
         <div class="library-card-title-row">
-          <h4>${art.name}</h4>
+          <h4>${escapeHtml(art.name || "Artwork")}</h4>
           ${art.modelObj ? `<span class="model-badge">🧊 3D Model</span>` : ""}
         </div>
-        <p>${art.details}</p>
+        <p>${escapeHtml(art.details || "")}</p>
         <span class="library-view-hint">Tap to view</span>
       </div>
     </div>
@@ -720,8 +728,19 @@ function renderLibrary() {
   });
 }
 
+function loadFullArtworkImage(imgEl, art) {
+  if (!imgEl || !art) return;
+  const fullImage = art.image || art.thumbnail;
+  if (!fullImage) return;
+  if (imgEl.dataset.fullSrc === fullImage) return;
+  imgEl.dataset.fullSrc = fullImage;
+  imgEl.loading = "eager";
+  imgEl.decoding = "async";
+  imgEl.src = fullImage;
+}
+
 function openLibraryDetail(art) {
-  libraryDetailImage.src = art.image;
+  loadFullArtworkImage(libraryDetailImage, art);
   libraryDetailImage.alt = art.name;
   libraryDetailTitle.textContent = art.name;
   libraryDetailText.textContent = art.details;
@@ -1597,29 +1616,45 @@ function openARCacheDB() {
 }
 
 function computeArtworkListSignature(artworkList) {
-  // Order-independent signature: any added/removed/changed marker image
-  // (built-in or Firebase) changes this string, forcing a recompile.
-  return artworkList
-    .map((a) => `${a.id}:${a.markerImage}`)
-    .sort()
-    .join("|");
+  const AR_CACHE_VERSION = "v2";
+
+  return [
+    AR_CACHE_VERSION,
+    ...artworkList
+      .map((a) => [a.id, a.markerImage || ""].join(":"))
+      .sort(),
+  ].join("|");
 }
 
 async function loadCachedCombinedTargets(signature) {
   try {
     const db = await openARCacheDB();
+
     return await new Promise((resolve, reject) => {
       const tx = db.transaction(AR_CACHE_STORE, "readonly");
-      const req = tx.objectStore(AR_CACHE_STORE).get(AR_CACHE_KEY);
+      const store = tx.objectStore(AR_CACHE_STORE);
+      const req = store.get(AR_CACHE_KEY);
+
       req.onsuccess = () => {
         const record = req.result;
-        if (record && record.signature === signature && record.buffer) {
+
+        if (
+          record &&
+          record.signature === signature &&
+          record.buffer instanceof ArrayBuffer &&
+          record.buffer.byteLength > 0
+        ) {
+          console.log("[AR] Using cached combined target library.");
           resolve(record.buffer);
-        } else {
-          resolve(null);
+          return;
         }
+
+        resolve(null);
       };
-      req.onerror = () => reject(req.error);
+
+      req.onerror = () => {
+        reject(req.error || new Error("IndexedDB read failed"));
+      };
     });
   } catch (err) {
     console.warn("[AR] Could not read cached target library:", err);
@@ -1628,36 +1663,80 @@ async function loadCachedCombinedTargets(signature) {
 }
 
 async function saveCachedCombinedTargets(signature, arrayBuffer) {
+  if (!(arrayBuffer instanceof ArrayBuffer)) {
+    console.warn("[AR] Refusing to cache invalid target buffer.");
+    return false;
+  }
+
+  if (arrayBuffer.byteLength === 0) {
+    console.warn("[AR] Refusing to cache empty target buffer.");
+    return false;
+  }
+
   try {
     const db = await openARCacheDB();
+
     await new Promise((resolve, reject) => {
       const tx = db.transaction(AR_CACHE_STORE, "readwrite");
-      tx.objectStore(AR_CACHE_STORE).put({ signature, buffer: arrayBuffer }, AR_CACHE_KEY);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+
+      tx.objectStore(AR_CACHE_STORE).put(
+        {
+          signature,
+          buffer: arrayBuffer,
+          savedAt: Date.now(),
+          size: arrayBuffer.byteLength,
+        },
+        AR_CACHE_KEY
+      );
+
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error("IndexedDB write failed"));
+      tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
     });
+
+    console.log(
+      `[AR] Cached combined target library (${arrayBuffer.byteLength} bytes).`
+    );
+
+    return true;
   } catch (err) {
-    console.warn("[AR] Could not cache target library (will recompile next visit):", err);
+    console.warn(
+      "[AR] Could not cache target library. The app will still work, but it may recompile next visit.",
+      err
+    );
+    return false;
   }
 }
 
 function loadImage(src) {
   return new Promise((resolve, reject) => {
-    const img = new Image();
+    if (!src) {
+      reject(new Error("Empty image URL."));
+      return;
+    }
 
-    // Required for Firebase Storage images to be usable by canvas/MindAR
+    const img = new Image();
     img.crossOrigin = "anonymous";
+    img.decoding = "async";
+
+    const cleanup = () => {
+      img.onload = null;
+      img.onerror = null;
+    };
 
     img.onload = () => {
       if (!img.naturalWidth || !img.naturalHeight) {
+        cleanup();
         reject(new Error(`Image loaded but has no dimensions: ${src}`));
         return;
       }
 
+      cleanup();
       resolve(img);
     };
 
     img.onerror = () => {
+      cleanup();
       reject(new Error(`Could not load marker image: ${src}`));
     };
 
@@ -1669,36 +1748,26 @@ function loadImage(src) {
 // faster compilation, at a small cost to tracking robustness on very
 // low-detail images. 1200px was overkill for marker detection; ~800px is
 // the sweet spot most MindAR projects use.
-function prepareMarkerImage(img, maxDim = 800) {
+function prepareMarkerImage(img, maxDim = 640) {
   const scale = Math.min(
     1,
     maxDim / Math.max(img.naturalWidth, img.naturalHeight)
   );
 
   const canvas = document.createElement("canvas");
-
-  canvas.width = Math.max(
-    1,
-    Math.round(img.naturalWidth * scale)
-  );
-
-  canvas.height = Math.max(
-    1,
-    Math.round(img.naturalHeight * scale)
-  );
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
 
   const ctx = canvas.getContext("2d", {
     alpha: false,
-    willReadFrequently: true
+    willReadFrequently: true,
   });
 
-  ctx.drawImage(
-    img,
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
+  if (!ctx) {
+    throw new Error("Could not create canvas context for marker image.");
+  }
+
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
   try {
     ctx.getImageData(0, 0, 1, 1);
@@ -1957,6 +2026,48 @@ function buildARScene(scannable, imageTargetSrc, mode = "builtin") {
   return arScene;
 }
 
+async function loadMarkerImagesWithConcurrency(artworkList, concurrency = 4) {
+  const results = new Array(artworkList.length);
+  let nextIndex = 0;
+  let completed = 0;
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= artworkList.length) return;
+
+      const art = artworkList[index];
+
+      try {
+        const image = await loadImage(art.markerImage);
+        results[index] = { status: "fulfilled", value: image };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+
+      completed++;
+
+      updateFirebaseARStatus({
+        phase: "loading-images",
+        progress: artworkList.length
+          ? 10 + (completed / artworkList.length) * 10
+          : 10,
+        loaded: completed,
+        total: artworkList.length,
+        message: `Loading AR images (${completed}/${artworkList.length})…`,
+      });
+    }
+  }
+
+  const workerCount = Math.min(concurrency, artworkList.length);
+
+  await Promise.all(
+    Array.from({ length: workerCount }, () => worker())
+  );
+
+  return results;
+}
+
 // -------------------------------------------------------------------
 // Background compilation of Firebase + built-in markers
 // -------------------------------------------------------------------
@@ -2052,8 +2163,9 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       message: `Downloading ${combinedArtworkList.length} marker image(s)…`,
     });
 
-    const results = await Promise.allSettled(
-      combinedArtworkList.map((art) => loadImage(art.markerImage))
+    const results = await loadMarkerImagesWithConcurrency(
+      combinedArtworkList,
+      4
     );
 
     const compiledArtworks = [];
@@ -2357,40 +2469,85 @@ async function initAR() {
 // DYNAMIC ARTWORK LOADING (built-in + Firebase uploads)
 // =====================================================================
 async function initArtworks() {
-  // Start with built-in artworks
-  let merged = BUILTIN_ARTWORKS.map((a) => ({ ...a }));
+  // Always start with built-in artworks so the local museum works even
+  // when Firebase is unavailable or the device is offline.
+  const merged = BUILTIN_ARTWORKS.map((a) => ({ ...a }));
 
-  // Fetch uploaded artworks from Firebase
+  // Do not wait on Firebase at all when the browser is offline.
+  if (navigator.onLine === false) {
+    console.log("[Firebase] Offline — using built-in artworks only.");
+    artworks = merged;
+    return;
+  }
+
   try {
-    const res = await fetch(`${FIREBASE_URL}/artworks.json`);
-    if (res.ok) {
-      const data = await res.json();
-      if (data) {
-        const uploaded = Object.entries(data).map(([key, val]) => ({
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch(`${FIREBASE_URL}/artworks.json`, {
+      method: "GET",
+      cache: "default",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      throw new Error(`Firebase returned HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    if (!data || typeof data !== "object") {
+      artworks = merged;
+      return;
+    }
+
+    const uploaded = Object.entries(data)
+      .map(([key, val]) => {
+        if (!val || typeof val !== "object") return null;
+
+        const image = val.image || "";
+        const thumbnail = val.thumbnail || image;
+        const markerImage = val.markerImage || image;
+
+        if (!image) {
+          console.warn(`[Firebase] Artwork "${key}" has no image URL.`);
+          return null;
+        }
+
+        return {
           id: key,
-          name: val.name,
-          image: val.image,
-          artist: val.artist,
-          year: val.year,
-          location: val.location,
-          details: val.details,
-          markerImage: val.image,       // uploaded image IS the marker
-          modelObj: null,               // no 3D model for uploads
+          name: val.name || "Untitled Artwork",
+          image,
+          thumbnail,
+          markerImage,
+          artist: val.artist || "",
+          year: val.year || "",
+          location: val.location || "",
+          details: val.details || "",
+          modelObj: null,
           modelMtl: null,
-          baseScale: val.baseScale || 0.06,
+          baseScale: Number(val.baseScale) || 0.06,
           icon: val.icon || "🖼️",
           unlocked: false,
           quizCompleted: false,
-          quiz: val.quiz || [],
-        }));
-        merged = merged.concat(uploaded);
-      }
-    }
-  } catch (err) {
-    console.warn("Could not load uploaded artworks from Firebase:", err);
-  }
+          quiz: Array.isArray(val.quiz) ? val.quiz : [],
+        };
+      })
+      .filter(Boolean);
 
-  artworks = merged;
+    artworks = merged.concat(uploaded);
+    console.log(`[Firebase] Loaded ${uploaded.length} uploaded artwork(s).`);
+  } catch (err) {
+    if (err.name === "AbortError") {
+      console.warn("[Firebase] Artwork request timed out. Continuing with built-in artworks.");
+    } else {
+      console.warn("[Firebase] Could not load uploaded artworks:", err);
+    }
+
+    artworks = merged;
+  }
 }
 
 
