@@ -618,7 +618,6 @@ function showLibrary() {
 function showSettings() {
   hideAllScreens();
   settingsCurrentName.textContent = `Currently: ${currentUsername || "—"}`;
-  ensureSettingsARStatus();
   screenSettings.classList.remove("hidden");
   bottomNav.classList.add("hidden");
   setBgLayerForScreen(false);
@@ -1559,55 +1558,6 @@ let activeTargetCount = 0;
 let activeARTargetMode = "builtin";
 let combinedObjectUrl = null;
 
-// Non-blocking Firebase AR preparation status. It is also exposed on
-// window.firebaseARStatus so you can inspect it from the browser console.
-let firebaseARStatus = {
-  phase: "not-started",
-  progress: 0,
-  loaded: 0,
-  total: 0,
-  ready: false,
-  message: "Firebase AR preparation has not started yet."
-};
-
-function updateFirebaseARStatus(patch = {}) {
-  firebaseARStatus = { ...firebaseARStatus, ...patch };
-  window.firebaseARStatus = { ...firebaseARStatus };
-
-  const statusEl = document.getElementById("settings-ar-status");
-  if (!statusEl) return;
-
-  const pct = Math.max(0, Math.min(100, Math.round(firebaseARStatus.progress || 0)));
-  statusEl.innerHTML = `
-    <div style="font-weight:700;margin-bottom:6px;">Firebase AR</div>
-    <div style="font-size:13px;line-height:1.4;">${firebaseARStatus.message}</div>
-    <div style="height:6px;background:rgba(255,255,255,.12);border-radius:999px;overflow:hidden;margin-top:9px;">
-      <div style="height:100%;width:${pct}%;background:currentColor;border-radius:999px;transition:width .25s ease;"></div>
-    </div>
-    <div style="font-size:11px;opacity:.7;margin-top:5px;">${pct}%</div>
-  `;
-}
-
-function ensureSettingsARStatus() {
-  if (!screenSettings) return null;
-
-  let statusEl = document.getElementById("settings-ar-status");
-  if (!statusEl) {
-    statusEl = document.createElement("div");
-    statusEl.id = "settings-ar-status";
-    statusEl.style.cssText =
-      "margin:16px 0;padding:12px 14px;border-radius:12px;" +
-      "background:rgba(255,255,255,.06);color:inherit;" +
-      "border:1px solid rgba(255,255,255,.12);";
-    screenSettings.insertBefore(statusEl, screenSettings.firstChild);
-  }
-
-  updateFirebaseARStatus();
-  return statusEl;
-}
-
-window.firebaseARStatus = { ...firebaseARStatus };
-
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -1939,15 +1889,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       `[AR] Preparing ${uploadedArtworks.length} Firebase marker(s) in the background…`
     );
 
-    updateFirebaseARStatus({
-      phase: "loading-images",
-      progress: 0,
-      loaded: 0,
-      total: uploadedArtworks.length,
-      ready: false,
-      message: `Loading ${uploadedArtworks.length} Firebase artwork marker(s)…`
-    });
-
     // IMPORTANT: the built-in marker images are compiled into the combined
     // library using the exact same local files already used by the app.
     // The existing static targets.mind is still used first, so built-ins are
@@ -1957,31 +1898,8 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       ...uploadedArtworks,
     ];
 
-    let loadedUploaded = 0;
-    let settledTotal = 0;
-    const totalImages = combinedArtworkList.length;
-
     const results = await Promise.allSettled(
-      combinedArtworkList.map((art) =>
-        loadImage(art.markerImage)
-          .then((img) => {
-            if (!bundledTargetIds.has(art.id)) loadedUploaded += 1;
-            return img;
-          })
-          .finally(() => {
-            settledTotal += 1;
-
-            const imageProgress = Math.round((settledTotal / totalImages) * 40);
-            updateFirebaseARStatus({
-              phase: "loading-images",
-              progress: imageProgress,
-              loaded: loadedUploaded,
-              total: uploadedArtworks.length,
-              ready: false,
-              message: `Loading Firebase marker images… ${loadedUploaded}/${uploadedArtworks.length} uploaded artwork(s)`
-            });
-          })
-      )
+      combinedArtworkList.map((art) => loadImage(art.markerImage))
     );
 
     const compiledArtworks = [];
@@ -2019,14 +1937,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       console.warn(
         "[AR] No Firebase marker images could be compiled. Keeping the original built-in AR scene."
       );
-      updateFirebaseARStatus({
-        phase: "error",
-        progress: 40,
-        loaded: 0,
-        total: uploadedArtworks.length,
-        ready: false,
-        message: `⚠ None of the ${uploadedArtworks.length} Firebase marker(s) could be prepared.`
-      });
       return null;
     }
 
@@ -2035,11 +1945,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
         "[AR] Firebase markers loaded, but no built-in marker could be compiled. " +
         "Keeping the original built-in AR scene to protect existing functionality."
       );
-      updateFirebaseARStatus({
-        phase: "error",
-        ready: false,
-        message: "⚠ Firebase markers loaded, but the built-in marker set could not be compiled. Original AR was kept."
-      });
       return null;
     }
 
@@ -2048,27 +1953,7 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
     );
 
     const compiler = new window.MINDAR.IMAGE.Compiler();
-    updateFirebaseARStatus({
-      phase: "compiling",
-      progress: 40,
-      loaded: uploadedCompiledCount,
-      total: uploadedArtworks.length,
-      ready: false,
-      message: `Preparing recognition data for ${uploadedCompiledCount} Firebase artwork(s)…`
-    });
-
-    await compiler.compileImageTargets(images, (progress) => {
-      const normalizedProgress = progress <= 1 ? progress * 100 : progress;
-      const overallProgress = 40 + Math.round((normalizedProgress / 100) * 55);
-      updateFirebaseARStatus({
-        phase: "compiling",
-        progress: overallProgress,
-        loaded: uploadedCompiledCount,
-        total: uploadedArtworks.length,
-        ready: false,
-        message: `Preparing recognition data… ${Math.round(normalizedProgress)}%`
-      });
-    });
+    await compiler.compileImageTargets(images);
 
     const exportedBuffer = await compiler.exportData();
 
@@ -2090,15 +1975,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       `[AR] Combined target library ready: ${compiledArtworks.length} total target(s).`
     );
 
-    updateFirebaseARStatus({
-      phase: "ready",
-      progress: 100,
-      loaded: uploadedCompiledCount,
-      total: uploadedArtworks.length,
-      ready: true,
-      message: `✓ Firebase artworks ready: ${uploadedCompiledCount}/${uploadedArtworks.length} uploaded artwork(s) available for AR.`
-    });
-
     // Only restart MindAR automatically if the user is actually looking at
     // the scanner. If they are elsewhere in the app, keep the compiled data
     // ready and activate it the next time they open the scanner.
@@ -2115,11 +1991,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
   })().catch((err) => {
     console.error("[AR] Background combined marker compilation failed:", err);
     combinedTargetData = null;
-    updateFirebaseARStatus({
-      phase: "error",
-      ready: false,
-      message: `⚠ Firebase AR preparation failed: ${err?.message || "unknown error"}`
-    });
     return null;
   });
 
@@ -2652,19 +2523,6 @@ async function bootMuseum() {
     });
   }
   await initArtworks();
-  const firebaseArtworkCount = artworks.filter(
-    (a) => a.markerImage && !BUILTIN_ARTWORKS.some((b) => b.id === a.id)
-  ).length;
-  updateFirebaseARStatus({
-    phase: "waiting",
-    progress: 0,
-    loaded: 0,
-    total: firebaseArtworkCount,
-    ready: false,
-    message: firebaseArtworkCount
-      ? `Firebase artworks loaded. Preparing ${firebaseArtworkCount} marker(s) in the background…`
-      : "No Firebase-uploaded artworks found yet."
-  });
   restoreProgress();
   if (currentUsername) {
     screenUsername.classList.add("hidden");
