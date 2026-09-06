@@ -281,28 +281,56 @@ const btnImmersive = document.getElementById("btn-immersive");
 
 // Browsers decide whether an install prompt is available. Installed launches use
 // the manifest's standalone display mode, which removes browser chrome.
-let deferredInstallPrompt = null;
 const isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
-if (!isStandalone && /iphone|ipad|ipod/i.test(navigator.userAgent)) {
-  installAppHint.textContent = "To open without the browser bar, tap Share and choose Add to Home Screen.";
-  installAppHint.classList.remove("hidden");
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+
+function updateInstallUI() {
+  if (isStandalone) {
+    btnInstallApp.classList.add("hidden");
+    installAppHint.classList.add("hidden");
+    return;
+  }
+
+  // Android / PC: native prompt captured by early script in <head>
+  if (window.deferredInstallPrompt && !isIOS) {
+    btnInstallApp.textContent = "Install Museum App";
+    btnInstallApp.classList.remove("hidden");
+    installAppHint.classList.add("hidden");
+    return;
+  }
+
+  // iOS: native prompt is impossible — show manual help
+  if (isIOS) {
+    btnInstallApp.textContent = "How to Install";
+    btnInstallApp.classList.remove("hidden");
+    installAppHint.textContent = "Tap the button above for iOS install steps.";
+    installAppHint.classList.remove("hidden");
+    return;
+  }
 }
-window.addEventListener("beforeinstallprompt", (event) => {
-  event.preventDefault();
-  deferredInstallPrompt = event;
-  btnInstallApp.classList.remove("hidden");
-});
+
 btnInstallApp.addEventListener("click", async () => {
-  if (!deferredInstallPrompt) return;
-  deferredInstallPrompt.prompt();
-  await deferredInstallPrompt.userChoice;
-  deferredInstallPrompt = null;
+  if (isIOS) {
+    alert("To install on iPhone/iPad:\n\n1. Tap the Share button (⬆️) in Safari's toolbar\n2. Scroll down and tap 'Add to Home Screen'\n3. Tap 'Add'");
+    return;
+  }
+  const prompt = window.deferredInstallPrompt;
+  if (!prompt) return;
+  prompt.prompt();
+  await prompt.userChoice;
+  window.deferredInstallPrompt = null;
   btnInstallApp.classList.add("hidden");
 });
+
 window.addEventListener("appinstalled", () => {
+  window.deferredInstallPrompt = null;
   btnInstallApp.classList.add("hidden");
   installAppHint.classList.add("hidden");
 });
+
+// Run now, and also re-run if the late event fires
+updateInstallUI();
+window.addEventListener('beforeinstallprompt', () => updateInstallUI());
 
 // -------------------------------------------------------------------
 // Username / session
