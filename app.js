@@ -1528,20 +1528,67 @@ function getPinchDistance(touches) {
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
+
+    // Required for Firebase Storage images to be usable by canvas/MindAR
     img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = reject;
+
+    img.onload = () => {
+      if (!img.naturalWidth || !img.naturalHeight) {
+        reject(new Error(`Image loaded but has no dimensions: ${src}`));
+        return;
+      }
+
+      resolve(img);
+    };
+
+    img.onerror = () => {
+      reject(new Error(`Could not load marker image: ${src}`));
+    };
+
     img.src = src;
   });
 }
 
-function downscaleForCompile(img, maxDim = 700) {
-  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-  if (scale === 1) return img;
+function prepareMarkerImage(img, maxDim = 1200) {
+  const scale = Math.min(
+    1,
+    maxDim / Math.max(img.naturalWidth, img.naturalHeight)
+  );
+
   const canvas = document.createElement("canvas");
-  canvas.width = Math.round(img.width * scale);
-  canvas.height = Math.round(img.height * scale);
-  canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  canvas.width = Math.max(
+    1,
+    Math.round(img.naturalWidth * scale)
+  );
+
+  canvas.height = Math.max(
+    1,
+    Math.round(img.naturalHeight * scale)
+  );
+
+  const ctx = canvas.getContext("2d", {
+    alpha: false,
+    willReadFrequently: true
+  });
+
+  ctx.drawImage(
+    img,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  try {
+    ctx.getImageData(0, 0, 1, 1);
+  } catch (err) {
+    throw new Error(
+      "Firebase marker image is blocked by CORS. " +
+      "Firebase Storage must allow this website to read the image."
+    );
+  }
+
   return canvas;
 }
 
@@ -1737,7 +1784,7 @@ async function initAR() {
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         compiled.push(scannable[i]);
-        images.push(downscaleForCompile(result.value));
+        images.push(prepareMarkerImage(result.value));
       } else {
         console.error(
           `Marker image failed to load for "${scannable[i].name}" (${scannable[i].markerImage}). ` +
