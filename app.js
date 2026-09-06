@@ -621,6 +621,7 @@ function showSettings() {
   screenSettings.classList.remove("hidden");
   bottomNav.classList.add("hidden");
   setBgLayerForScreen(false);
+  ensureSettingsARStatus();
 }
 
 btnBackHome.addEventListener("click", showHome);
@@ -2161,6 +2162,57 @@ async function initArtworks() {
   artworks = merged;
 }
 
+
+// =====================================================================
+// FIREBASE AR PREPARATION STATUS
+// =====================================================================
+let firebaseARStatus = {
+  phase: "not-started",
+  progress: 0,
+  loaded: 0,
+  total: 0,
+  ready: false,
+  message: "Firebase AR preparation has not started yet."
+};
+
+function updateFirebaseARStatus(patch = {}) {
+  firebaseARStatus = { ...firebaseARStatus, ...patch };
+  window.firebaseARStatus = { ...firebaseARStatus };
+
+  const statusEl = document.getElementById("settings-ar-status");
+  if (!statusEl) return;
+
+  const pct = Math.max(0, Math.min(100, Math.round(firebaseARStatus.progress || 0)));
+  statusEl.innerHTML = `
+    <div style="font-weight:700;margin-bottom:6px;">Firebase AR</div>
+    <div style="font-size:13px;line-height:1.4;">${firebaseARStatus.message}</div>
+    <div style="height:6px;background:rgba(255,255,255,.12);border-radius:999px;overflow:hidden;margin-top:9px;">
+      <div style="height:100%;width:${pct}%;background:currentColor;border-radius:999px;transition:width .25s ease;"></div>
+    </div>
+    <div style="font-size:11px;opacity:.7;margin-top:5px;">${pct}%</div>
+  `;
+}
+
+function ensureSettingsARStatus() {
+  if (!screenSettings) return null;
+
+  let statusEl = document.getElementById("settings-ar-status");
+  if (!statusEl) {
+    statusEl = document.createElement("div");
+    statusEl.id = "settings-ar-status";
+    statusEl.style.cssText =
+      "margin:16px 0;padding:12px 14px;border-radius:12px;" +
+      "background:rgba(255,255,255,.06);color:inherit;" +
+      "border:1px solid rgba(255,255,255,.12);";
+    screenSettings.insertBefore(statusEl, screenSettings.firstChild);
+  }
+
+  updateFirebaseARStatus();
+  return statusEl;
+}
+
+window.firebaseARStatus = { ...firebaseARStatus };
+
 // =====================================================================
 // ANALYTICS: page visits + presence heartbeat
 // =====================================================================
@@ -2523,6 +2575,21 @@ async function bootMuseum() {
     });
   }
   await initArtworks();
+
+  const firebaseArtworkCount = artworks.filter(
+    (a) => a.markerImage && !BUILTIN_ARTWORKS.some((b) => b.id === a.id)
+  ).length;
+
+  updateFirebaseARStatus({
+    phase: "waiting",
+    progress: 0,
+    loaded: 0,
+    total: firebaseArtworkCount,
+    ready: false,
+    message: firebaseArtworkCount
+      ? `Firebase artworks loaded. Waiting to prepare ${firebaseArtworkCount} marker(s) for AR…`
+      : "No Firebase-uploaded artworks found yet."
+  });
   restoreProgress();
   if (currentUsername) {
     screenUsername.classList.add("hidden");
