@@ -1698,38 +1698,50 @@ function checkCollectionComplete() {
 // Build AR scene
 // -------------------------------------------------------------------
 async function initAR() {
-  // The three bundled targets are compiled once into assets/targets.mind. Firebase
-  // uploads remain browseable offline, but must be added to a future target build
-  // before they can be recognized by AR.
   const bundledTargetIds = new Set(BUILTIN_ARTWORKS.filter((a) => a.markerImage).map((a) => a.id));
-  const staticScannable = artworks.filter((a) => bundledTargetIds.has(a.id));
-  let scannable = staticScannable;
+  
+  // If there are uploaded (non-builtin) artworks, we MUST compile at runtime
+  // because the static targets.mind only contains built-ins.
+  const hasUploadedMarkers = artworks.some((a) => a.markerImage && !bundledTargetIds.has(a.id));
+  
+  let scannable = [];
   let imageTargetSrc = "./assets/targets.mind";
+  let useRuntimeCompile = hasUploadedMarkers;
 
-  try {
-    const targetResponse = await fetch(imageTargetSrc, { cache: "no-store" });
-    if (!targetResponse.ok) throw new Error(`status ${targetResponse.status}`);
-    loadingText.textContent = "Recognition data ready. Starting camera…";
-  } catch (error) {
-    // Keep the existing experience functional until the one-time target build has
-    // been generated. This branch is removed from normal first launch once the
-    // static targets.mind asset exists.
-    console.warn("Static MindAR target file is missing; using temporary runtime compilation.", error);
-    const scannableAll = artworks.filter((a) => a.markerImage);
+  // Try the fast path (pre-compiled .mind file) only if no uploaded markers exist
+  if (!useRuntimeCompile) {
+    try {
+      const targetResponse = await fetch(imageTargetSrc, { cache: "no-store" });
+      if (!targetResponse.ok) throw new Error(`status ${targetResponse.status}`);
+      loadingText.textContent = "Recognition data ready. Starting camera…";
+      scannable = artworks.filter((a) => bundledTargetIds.has(a.id) && a.markerImage);
+    } catch (error) {
+      console.warn("Static MindAR target file missing; using runtime compilation.", error);
+      useRuntimeCompile = true;
+    }
+  }
+
+  // Runtime compilation path: works for both built-in AND uploaded artworks
+  if (useRuntimeCompile) {
+    scannable = artworks.filter((a) => a.markerImage);
+
+    if (scannable.length === 0) {
+      throw new Error("No artworks have marker images available for scanning.");
+    }
 
     loadingText.textContent = "Loading artwork images…";
-    const results = await Promise.allSettled(scannableAll.map((a) => loadImage(a.markerImage)));
+    const results = await Promise.allSettled(scannable.map((a) => loadImage(a.markerImage)));
 
-    scannable = [];
+    const compiled = [];
     const images = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
-        scannable.push(scannableAll[i]);
+        compiled.push(scannable[i]);
         images.push(downscaleForCompile(result.value));
       } else {
         console.error(
-          `Marker image failed to load for "${scannableAll[i].name}" (${scannableAll[i].markerImage}). ` +
-            `Check the file exists at that exact path/filename (case-sensitive) in your deployed assets folder.`
+          `Marker image failed to load for "${scannable[i].name}" (${scannable[i].markerImage}). ` +
+          `Check the file exists and CORS is enabled if it's an external URL.`
         );
       }
     });
@@ -1745,6 +1757,7 @@ async function initAR() {
     });
     const exportedBuffer = await compiler.exportData();
     imageTargetSrc = URL.createObjectURL(new Blob([exportedBuffer]));
+    scannable = compiled;
   }
 
   const targetEntities = scannable
