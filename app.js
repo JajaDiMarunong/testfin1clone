@@ -1570,33 +1570,6 @@ function getPinchDistance(touches) {
 let arInitializationPromise = null;
 let firebaseArtworkLoadPromise = null;
 let firebaseARPreparationScheduled = false;
-let lastUserInteractionAt = performance.now();
-
-function noteUserInteraction() {
-  lastUserInteractionAt = performance.now();
-}
-
-["pointerdown", "touchstart", "keydown", "wheel"].forEach((eventName) => {
-  window.addEventListener(eventName, noteUserInteraction, { passive: true });
-});
-
-function waitForUiIdle(quietMs = 1200) {
-  return new Promise((resolve) => {
-    const check = () => {
-      const elapsed = performance.now() - lastUserInteractionAt;
-      if (elapsed >= quietMs) { resolve(); return; }
-      setTimeout(check, Math.max(100, quietMs - elapsed));
-    };
-    check();
-  });
-}
-
-function yieldToUi() {
-  return new Promise((resolve) => {
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(resolve);
-    else setTimeout(resolve, 0);
-  });
-}
 
 // The first AR scene uses the existing, proven targets.mind file so the
 // built-in artworks behave exactly as they did before.
@@ -1645,7 +1618,7 @@ function openARCacheDB() {
 }
 
 function computeArtworkListSignature(artworkList) {
-  const AR_CACHE_VERSION = "v2";
+  const AR_CACHE_VERSION = "v3-worker";
 
   return [
     AR_CACHE_VERSION,
@@ -2056,6 +2029,10 @@ function buildARScene(scannable, imageTargetSrc, mode = "builtin") {
 }
 
 async function loadMarkerImagesWithConcurrency(artworkList, concurrency = 4) {
+  // Download marker bytes on the main thread, but do NOT decode/resize them
+  // into canvases here. The compiler worker owns all image decoding and pixel
+  // processing so the UI thread stays available for navigation and AR camera
+  // rendering.
   const results = new Array(artworkList.length);
   let nextIndex = 0;
   let completed = 0;
@@ -2068,8 +2045,29 @@ async function loadMarkerImagesWithConcurrency(artworkList, concurrency = 4) {
       const art = artworkList[index];
 
       try {
-        const image = await loadImage(art.markerImage);
-        results[index] = { status: "fulfilled", value: image };
+        if (!art.markerImage) throw new Error("Artwork has no marker image URL.");
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
+        const response = await fetch(art.markerImage, {
+          mode: "cors",
+          cache: "default",
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} while loading marker image.`);
+        }
+
+        const blob = await response.blob();
+        if (!blob.size) throw new Error("Marker image response was empty.");
+        results[index] = {
+          status: "fulfilled",
+          value: {
+            bytes: await blob.arrayBuffer(),
+            type: blob.type || "image/jpeg",
+          },
+        };
       } catch (reason) {
         results[index] = { status: "rejected", reason };
       }
@@ -2089,12 +2087,257 @@ async function loadMarkerImagesWithConcurrency(artworkList, concurrency = 4) {
   }
 
   const workerCount = Math.min(concurrency, artworkList.length);
-
-  await Promise.all(
-    Array.from({ length: workerCount }, () => worker())
-  );
-
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
+}
+
+// -------------------------------------------------------------------
+// Firebase AR compilation worker
+// -------------------------------------------------------------------
+// MindAR 1.2.5's A-Frame bundle is intentionally NOT loaded in the worker.
+// The HTML loads that bundle for the live AR scene, but the compiler worker
+// needs the underlying MindAR IMAGE build instead. Keeping compilation in a
+// separate worker is what prevents compileImageTargets() from monopolizing
+// the page's main JavaScript thread.
+const MINDAR_CORE_SCRIPT_URL =
+  "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js";
+
+let firebaseCompilerWorker = null;
+let firebaseCompilerWorkerUrl = null;
+let firebaseCompilerJobId = 0;
+
+function getFirebaseCompilerWorkerSource() {
+  return `
+    // MindAR's browser bundle expects a window-like global in some builds.
+    self.window = self;
+
+    function normalizeExportedBuffer(exported) {
+      if (exported instanceof ArrayBuffer) return exported;
+      if (ArrayBuffer.isView(exported)) {
+        return exported.buffer.slice(
+          exported.byteOffset,
+          exported.byteOffset + exported.byteLength
+        );
+      }
+      if (exported && exported.buffer instanceof ArrayBuffer) {
+        return exported.buffer.slice(
+          exported.byteOffset || 0,
+          (exported.byteOffset || 0) + (exported.byteLength || exported.buffer.byteLength)
+        );
+      }
+      throw new Error("MindAR exportData() did not return binary target data.");
+    }
+
+    self.onmessage = async function(event) {
+      const msg = event.data || {};
+      if (msg.type !== "compile") return;
+
+      try {
+        if (typeof importScripts !== "function") {
+          throw new Error("This browser does not support classic Web Workers.");
+        }
+        if (typeof OffscreenCanvas === "undefined") {
+          throw new Error("OffscreenCanvas is unavailable in this browser.");
+        }
+        if (typeof createImageBitmap !== "function") {
+          throw new Error("createImageBitmap is unavailable in this browser.");
+        }
+
+        importScripts(msg.mindarScriptUrl);
+
+        if (!self.MINDAR || !self.MINDAR.IMAGE || !self.MINDAR.IMAGE.Compiler) {
+          throw new Error(
+            "MindAR 1.2.5 IMAGE.Compiler is not available inside the compiler worker."
+          );
+        }
+
+        const images = [];
+        const input = Array.isArray(msg.images) ? msg.images : [];
+        if (!input.length) throw new Error("No marker images were supplied.");
+
+        for (let i = 0; i < input.length; i++) {
+          const item = input[i];
+          const bytes = item.bytes instanceof ArrayBuffer
+            ? item.bytes
+            : item.bytes.buffer;
+          const blob = new Blob([bytes], { type: item.type || "image/jpeg" });
+          const bitmap = await createImageBitmap(blob);
+
+          // Keep the same 640px maximum dimension used by the original app,
+          // but perform the resize entirely inside this worker.
+          const maxDim = 640;
+          const scale = Math.min(
+            1,
+            maxDim / Math.max(bitmap.width, bitmap.height)
+          );
+          const width = Math.max(1, Math.round(bitmap.width * scale));
+          const height = Math.max(1, Math.round(bitmap.height * scale));
+
+          const canvas = new OffscreenCanvas(width, height);
+          const ctx = canvas.getContext("2d", {
+            alpha: false,
+            willReadFrequently: true,
+          });
+          if (!ctx) throw new Error("Could not create worker canvas context.");
+          ctx.drawImage(bitmap, 0, 0, width, height);
+          bitmap.close();
+          images.push(canvas);
+
+          self.postMessage({
+            type: "image-progress",
+            loaded: i + 1,
+            total: input.length,
+          });
+        }
+
+        const compiler = new self.MINDAR.IMAGE.Compiler();
+
+        await compiler.compileImageTargets(images, function(percent) {
+          const value = Math.max(0, Math.min(100, Number(percent) || 0));
+          self.postMessage({ type: "progress", percent: value });
+        });
+
+        const exported = await compiler.exportData();
+        const buffer = normalizeExportedBuffer(exported);
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) {
+          throw new Error("MindAR returned an empty target library.");
+        }
+
+        self.postMessage({ type: "done", buffer }, [buffer]);
+      } catch (error) {
+        self.postMessage({
+          type: "error",
+          error: error && error.message ? error.message : String(error),
+          detail: error && error.stack ? String(error.stack) : "",
+        });
+      }
+    };
+  `;
+}
+
+function terminateFirebaseCompilerWorker() {
+  if (firebaseCompilerWorker) {
+    try { firebaseCompilerWorker.terminate(); } catch (_) {}
+    firebaseCompilerWorker = null;
+  }
+  if (firebaseCompilerWorkerUrl) {
+    URL.revokeObjectURL(firebaseCompilerWorkerUrl);
+    firebaseCompilerWorkerUrl = null;
+  }
+}
+
+async function compileFirebaseTargetsOffMainThread(images) {
+  if (!Array.isArray(images) || images.length === 0) {
+    throw new Error("No marker images were supplied to the compiler worker.");
+  }
+
+  if (typeof Worker === "undefined") {
+    throw new Error("Web Workers are unavailable; Firebase AR compilation was skipped to protect the UI.");
+  }
+
+  terminateFirebaseCompilerWorker();
+
+  firebaseCompilerWorkerUrl = URL.createObjectURL(
+    new Blob([getFirebaseCompilerWorkerSource()], {
+      type: "application/javascript",
+    })
+  );
+  firebaseCompilerWorker = new Worker(firebaseCompilerWorkerUrl);
+  const jobId = ++firebaseCompilerJobId;
+
+  try {
+    const transferableImages = images.map((item) => {
+      if (!item || !(item.bytes instanceof ArrayBuffer)) {
+        throw new Error("A marker image did not contain transferable binary data.");
+      }
+      return {
+        bytes: item.bytes,
+        type: item.type || "image/jpeg",
+      };
+    });
+
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+
+      const cleanupHandlers = () => {
+        if (!firebaseCompilerWorker) return;
+        firebaseCompilerWorker.onmessage = null;
+        firebaseCompilerWorker.onerror = null;
+      };
+
+      const failOnce = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanupHandlers();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+
+      firebaseCompilerWorker.onmessage = (event) => {
+        if (jobId !== firebaseCompilerJobId) return;
+        const data = event.data || {};
+
+        if (data.type === "image-progress") {
+          const total = Number(data.total) || images.length;
+          const loaded = Number(data.loaded) || 0;
+          updateFirebaseARStatus({
+            phase: "preparing-images",
+            progress: total ? 10 + (loaded / total) * 10 : 10,
+            loaded,
+            total,
+            ready: false,
+            message: `Preparing AR images (${loaded}/${total})…`,
+          });
+          return;
+        }
+
+        if (data.type === "progress") {
+          const percent = Math.max(0, Math.min(100, Number(data.percent) || 0));
+          updateFirebaseARStatus({
+            phase: "compiling",
+            progress: 20 + percent * 0.70,
+            ready: false,
+            message: `Compiling AR targets (${Math.round(percent)}%)…`,
+          });
+          return;
+        }
+
+        if (data.type === "done") {
+          if (!(data.buffer instanceof ArrayBuffer) || data.buffer.byteLength === 0) {
+            failOnce(new Error("Compiler worker returned an empty target library."));
+            return;
+          }
+          settled = true;
+          cleanupHandlers();
+          resolve(data.buffer);
+          return;
+        }
+
+        if (data.type === "error") {
+          failOnce(new Error(data.error || "Firebase AR compiler worker failed."));
+        }
+      };
+
+      firebaseCompilerWorker.onerror = (event) => {
+        failOnce(new Error(
+          event && event.message
+            ? `Firebase AR compiler worker error: ${event.message}`
+            : "Firebase AR compiler worker crashed."
+        ));
+      };
+
+      const transfer = transferableImages.map((item) => item.bytes);
+      firebaseCompilerWorker.postMessage(
+        {
+          type: "compile",
+          mindarScriptUrl: MINDAR_CORE_SCRIPT_URL,
+          images: transferableImages,
+        },
+        transfer
+      );
+    });
+  } finally {
+    terminateFirebaseCompilerWorker();
+  }
 }
 
 // -------------------------------------------------------------------
@@ -2206,10 +2449,8 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
 
       if (result.status === "fulfilled") {
         try {
-          await waitForUiIdle(150);
-          await yieldToUi();
           compiledArtworks.push(art);
-          images.push(prepareMarkerImage(result.value));
+          images.push(result.value);
         } catch (err) {
           console.error(
             `[AR] Could not prepare marker image for "${art.name}":`,
@@ -2223,9 +2464,6 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
         );
       }
     }
-
-    await waitForUiIdle(1800);
-    await yieldToUi();
 
     const builtinCompiledCount = compiledArtworks.filter((art) =>
       bundledTargetIds.has(art.id)
@@ -2274,45 +2512,21 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       message: `Compiling AR targets (0%)…`,
     });
 
-    const compiler = new window.MINDAR.IMAGE.Compiler();
+    // IMPORTANT: the CPU-heavy MindAR compiler runs ONLY inside a Web Worker.
+    // There is intentionally no main-thread fallback here; doing so would
+    // recreate the UI freeze this architecture is designed to eliminate.
+    const markerPayloads = images.map((item) => item.value);
 
-    // MindAR's compiler *may* call this with a 0-100 percent as each target
-    // finishes — if so we use real numbers. But not every build reliably
-    // fires it, so we also run a gentle simulated-progress ticker in
-    // parallel (an ease-toward-88% curve) purely so the bar keeps visibly
-    // moving during the slow compile step instead of sitting frozen. Real
-    // progress, when it arrives, always overrides the simulated value.
-    let compileProgress = 20;
-    const progressTicker = setInterval(() => {
-      compileProgress += (88 - compileProgress) * 0.12;
-      updateFirebaseARStatus({
-        phase: "compiling",
-        progress: compileProgress,
-        message: `Compiling AR targets…`,
-      });
-    }, 600);
-
-    try {
-      await compiler.compileImageTargets(images, (percent) => {
-        const clamped = Math.max(0, Math.min(100, percent));
-        compileProgress = 20 + (clamped / 100) * 70; // 20%–90% of the overall bar
-        updateFirebaseARStatus({
-          phase: "compiling",
-          progress: compileProgress,
-          message: `Compiling AR targets (${Math.round(clamped)}%)…`,
-        });
-      });
-    } finally {
-      clearInterval(progressTicker);
-    }
+    const exportedBuffer = await compileFirebaseTargetsOffMainThread(markerPayloads);
 
     updateFirebaseARStatus({
       phase: "exporting",
       progress: 92,
+      loaded: compiledArtworks.length,
+      total: combinedArtworkList.length,
+      ready: false,
       message: `Finalizing AR target library…`,
     });
-
-    const exportedBuffer = await compiler.exportData();
 
     // Cache this result for next time, keyed to exactly this artwork set.
     // If the buffer is very large this may silently no-op (see the
@@ -2465,7 +2679,7 @@ async function initAR() {
     if (result.status === "fulfilled") {
       try {
         compiled.push(fallbackScannable[i]);
-        images.push(prepareMarkerImage(result.value));
+        images.push(result.value);
       } catch (err) {
         console.error(
           `Marker image could not be prepared for "${fallbackScannable[i].name}":`,
@@ -2486,9 +2700,11 @@ async function initAR() {
     );
   }
 
-  const compiler = new window.MINDAR.IMAGE.Compiler();
-  await compiler.compileImageTargets(images);
-  const exportedBuffer = await compiler.exportData();
+  // The fallback path is also worker-only. Never put MindAR's compiler back
+  // on the main thread, even when the static targets.mind file is unavailable.
+  const exportedBuffer = await compileFirebaseTargetsOffMainThread(
+    images.map((item) => item.value)
+  );
   const fallbackObjectUrl = URL.createObjectURL(
     new Blob([exportedBuffer], { type: "application/octet-stream" })
   );
@@ -2592,7 +2808,7 @@ async function loadFirebaseArtworksInBackground() {
 
       updateFirebaseARStatus({
         phase: "waiting", progress: 0, loaded: 0, total: uploaded.length, ready: false,
-        message: "Firebase artworks loaded. AR preparation will run when the UI is idle.",
+        message: "Firebase artworks loaded. AR compilation is running in the background.",
       });
 
       if (!firebaseARPreparationScheduled) {
@@ -2600,7 +2816,6 @@ async function loadFirebaseArtworksInBackground() {
         setTimeout(async () => {
           try {
             if (arInitializationPromise) await arInitializationPromise;
-            await waitForUiIdle(2500);
             await prepareCombinedMarkersInBackground(bundledTargetIds);
           } catch (err) {
             console.error("[AR] Deferred Firebase preparation failed:", err);
