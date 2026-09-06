@@ -493,6 +493,10 @@ function hideFilterToast() {
 function renderGallery() {
   galleryGrid.innerHTML = "";
 
+  // Only the built-in 3D-model artworks belong in the locked/unlocked
+  // gallery. Firebase-uploaded artworks are marker-only (no modelObj) and
+  // are intentionally excluded here — they still unlock and show up in
+  // the Library, just not as gallery cards.
   const galleryArtworks = artworks.filter((a) => a.modelObj);
 
   const visible = galleryArtworks.filter((art) => {
@@ -1559,6 +1563,84 @@ let activeTargetCount = 0;
 let activeARTargetMode = "builtin";
 let combinedObjectUrl = null;
 
+// -------------------------------------------------------------------
+// Local cache for the compiled combined target library.
+//
+// Compiling MindAR targets in the browser (MINDAR.IMAGE.Compiler) is the
+// single slowest part of this app — it was previously re-run from scratch
+// on every page load, for every visitor, even when nothing had changed.
+// This cache stores the already-compiled binary in IndexedDB, keyed by a
+// signature of which artworks/marker images it was built from. As long as
+// nobody has uploaded/changed a Firebase artwork since last time, a return
+// visit on the same device skips compilation entirely and just reloads the
+// cached binary — which is close to instant.
+// -------------------------------------------------------------------
+const AR_CACHE_DB_NAME = "museum_ar_cache";
+const AR_CACHE_STORE = "targets";
+const AR_CACHE_KEY = "combined";
+
+function openARCacheDB() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB not available"));
+      return;
+    }
+    const req = indexedDB.open(AR_CACHE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(AR_CACHE_STORE)) {
+        req.result.createObjectStore(AR_CACHE_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function computeArtworkListSignature(artworkList) {
+  // Order-independent signature: any added/removed/changed marker image
+  // (built-in or Firebase) changes this string, forcing a recompile.
+  return artworkList
+    .map((a) => `${a.id}:${a.markerImage}`)
+    .sort()
+    .join("|");
+}
+
+async function loadCachedCombinedTargets(signature) {
+  try {
+    const db = await openARCacheDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(AR_CACHE_STORE, "readonly");
+      const req = tx.objectStore(AR_CACHE_STORE).get(AR_CACHE_KEY);
+      req.onsuccess = () => {
+        const record = req.result;
+        if (record && record.signature === signature && record.buffer) {
+          resolve(record.buffer);
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn("[AR] Could not read cached target library:", err);
+    return null;
+  }
+}
+
+async function saveCachedCombinedTargets(signature, arrayBuffer) {
+  try {
+    const db = await openARCacheDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(AR_CACHE_STORE, "readwrite");
+      tx.objectStore(AR_CACHE_STORE).put({ signature, buffer: arrayBuffer }, AR_CACHE_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn("[AR] Could not cache target library (will recompile next visit):", err);
+  }
+}
+
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -1583,7 +1665,11 @@ function loadImage(src) {
   });
 }
 
-function prepareMarkerImage(img, maxDim = 1200) {
+// Smaller maxDim = fewer pixels for MindAR's compiler to analyze = much
+// faster compilation, at a small cost to tracking robustness on very
+// low-detail images. 1200px was overkill for marker detection; ~800px is
+// the sweet spot most MindAR projects use.
+function prepareMarkerImage(img, maxDim = 800) {
   const scale = Math.min(
     1,
     maxDim / Math.max(img.naturalWidth, img.naturalHeight)
@@ -1899,6 +1985,46 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
       ...uploadedArtworks,
     ];
 
+    const signature = computeArtworkListSignature(combinedArtworkList);
+
+    // ---- Fast path: reuse a previously compiled target library ----
+    // If nothing about the artwork set (or their images) has changed since
+    // this device last compiled, skip straight to using the cached binary.
+    // This is what turns "slow every single time" into "slow once".
+    const cachedBuffer = await loadCachedCombinedTargets(signature);
+    if (cachedBuffer) {
+      console.log(
+        "[AR] Using cached combined target library (skipping recompilation)."
+      );
+
+      if (combinedObjectUrl) {
+        URL.revokeObjectURL(combinedObjectUrl);
+        combinedObjectUrl = null;
+      }
+      combinedObjectUrl = URL.createObjectURL(
+        new Blob([cachedBuffer], { type: "application/octet-stream" })
+      );
+
+      // The cache is only trusted when its signature matches the full,
+      // current artwork list exactly, so we can assume every artwork in
+      // combinedArtworkList was successfully included when it was built.
+      combinedTargetData = {
+        artworks: combinedArtworkList,
+        imageTargetSrc: combinedObjectUrl,
+      };
+
+      if (!screenScanner.classList.contains("hidden")) {
+        if (activeTargetCount > 0) {
+          combinedSwitchQueued = true;
+        } else {
+          await switchToCombinedAR();
+        }
+      }
+
+      return combinedTargetData;
+    }
+
+    // ---- Slow path: nothing cached (or artwork set changed) — compile ----
     const results = await Promise.allSettled(
       combinedArtworkList.map((art) => loadImage(art.markerImage))
     );
@@ -1957,6 +2083,13 @@ async function prepareCombinedMarkersInBackground(bundledTargetIds) {
     await compiler.compileImageTargets(images);
 
     const exportedBuffer = await compiler.exportData();
+
+    // Cache this result for next time, keyed to exactly this artwork set.
+    // If the buffer is very large this may silently no-op (see the
+    // try/catch inside saveCachedCombinedTargets) — that's fine, it just
+    // means this device will recompile again next visit.
+    const compiledSignature = computeArtworkListSignature(compiledArtworks);
+    saveCachedCombinedTargets(compiledSignature, exportedBuffer);
 
     if (combinedObjectUrl) {
       URL.revokeObjectURL(combinedObjectUrl);
