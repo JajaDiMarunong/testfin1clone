@@ -561,13 +561,25 @@ function showHome() {
   renderGallery();
 }
 
-function showScanner() {
+async function showScanner() {
   hideAllScreens();
   screenScanner.classList.remove("hidden");
   bottomNav.classList.add("hidden");
   setBgLayerForScreen(true);
-  scanHint.textContent = "Point your camera at an artwork";
+
+  scanHint.textContent = "Preparing camera…";
   scanHint.classList.remove("found");
+
+  try {
+    if (arInitializationPromise) {
+      await arInitializationPromise;
+    }
+
+    scanHint.textContent = "Point your camera at an artwork";
+  } catch (err) {
+    console.error("AR initialization failed:", err);
+    scanHint.textContent = "AR could not be started.";
+  }
 }
 
 function showBadges() {
@@ -1525,6 +1537,7 @@ function getPinchDistance(touches) {
 // =====================================================================
 // AR INITIALIZATION
 // =====================================================================
+let arInitializationPromise = null;
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -2246,16 +2259,22 @@ async function bootMuseum() {
     showHome();
     initTour();
   }
-  navigator.mediaDevices?.getUserMedia?.({ video: true })
-    .then((stream) => {
-      stream.getTracks().forEach((track) => track.stop());
-      return initAR();
-    })
-    .catch((err) => {
-      console.error("Camera/AR init failed:", err);
-      loadingScreen.classList.add("hidden");
-      permissionError.classList.remove("hidden");
+navigator.mediaDevices?.getUserMedia?.({ video: true })
+  .then((stream) => {
+    stream.getTracks().forEach((track) => track.stop());
+
+    // Start AR preparation in the background.
+    // Do NOT await it here, so the museum UI can continue loading.
+    arInitializationPromise = initAR().catch((err) => {
+      console.error("Background AR initialization failed:", err);
+      throw err;
     });
+  })
+  .catch((err) => {
+    console.error("Camera/AR init failed:", err);
+    loadingScreen.classList.add("hidden");
+    permissionError.classList.remove("hidden");
+  });
 }
 
 bootMuseum();
